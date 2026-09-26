@@ -10,77 +10,264 @@ import {
 import type { Analysis, AnalysisInputs, CoachMessage } from "./types";
 import { demoAnalysis } from "@/data/demo-analysis";
 
-const STORAGE_KEY = "careerlens.analysis.v1";
-const CHAT_KEY = "careerlens.coach.v1";
+const ANALYSES_KEY = "careerlens.analyses.v2";
+const ACTIVE_KEY = "careerlens.active-analysis.v2";
+const CHAT_PREFIX = "careerlens.coach.v2.";
 
-interface Store {
+type NamedAnalysis = Analysis & { name?: string };
+
+type Store = {
   analysis: Analysis | null;
+  analyses: NamedAnalysis[];
+  activeAnalysisId: string | null;
+  isDemo: boolean;
   messages: CoachMessage[];
   setAnalysis: (a: Analysis) => void;
+  selectAnalysis: (id: string) => void;
   loadDemo: () => void;
   clear: () => void;
+  removeAnalysis: (id: string) => void;
+  renameAnalysis: (id: string, name: string) => void;
   setMessages: (m: CoachMessage[]) => void;
   ready: boolean;
-}
+};
 
 const AnalysisContext = createContext<Store | null>(null);
 
+function readAnalyses(): NamedAnalysis[] {
+  try {
+    const raw = window.localStorage.getItem(ANALYSES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is Analysis =>
+        Boolean(item) &&
+        typeof item === "object" &&
+        "id" in item &&
+        typeof (item as { id?: unknown }).id === "string" &&
+        !(item as { isDemo?: boolean }).isDemo,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeAnalyses(analyses: Analysis[]) {
+  try {
+    window.localStorage.setItem(ANALYSES_KEY, JSON.stringify(analyses));
+  } catch {
+    /* storage unavailable — state still works for this session */
+  }
+}
+
+function chatKey(id: string) {
+  return `${CHAT_PREFIX}${id}`;
+}
+
+function readChat(id: string): CoachMessage[] {
+  try {
+    const raw = window.localStorage.getItem(chatKey(id));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? (parsed as CoachMessage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function AnalysisProvider({ children }: { children: ReactNode }) {
-  const [analysis, setAnalysisState] = useState<Analysis | null>(null);
+  const [analyses, setAnalysesState] = useState<NamedAnalysis[]>([]);
+  const [activeAnalysisId, setActiveAnalysisIdState] = useState<string | null>(null);
+  const [isDemo, setIsDemo] = useState(false);
   const [messages, setMessagesState] = useState<CoachMessage[]>([]);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    const storedAnalyses = readAnalyses();
+    let storedActiveId: string | null = null;
+
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) setAnalysisState(JSON.parse(raw) as Analysis);
-      const chat = window.localStorage.getItem(CHAT_KEY);
-      if (chat) setMessagesState(JSON.parse(chat) as CoachMessage[]);
+      storedActiveId = window.localStorage.getItem(ACTIVE_KEY);
     } catch {
-      // Corrupt or unavailable storage: start from a clean state.
+      /* ignore */
     }
+
+    const validActiveId = storedAnalyses.some((a) => a.id === storedActiveId)
+      ? storedActiveId
+      : storedAnalyses[0]?.id ?? null;
+
+    setAnalysesState(storedAnalyses);
+    setActiveAnalysisIdState(validActiveId);
+    setMessagesState(validActiveId ? readChat(validActiveId) : []);
     setReady(true);
   }, []);
 
-  const setAnalysis = useCallback((a: Analysis) => {
-    setAnalysisState(a);
-    setMessagesState([]);
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(a));
-      window.localStorage.removeItem(CHAT_KEY);
-    } catch {
-      /* storage unavailable — analysis stays in memory for this session */
-    }
-  }, []);
-
-  const loadDemo = useCallback(
-    () => setAnalysis({ ...demoAnalysis, createdAt: new Date().toISOString() }),
-    [setAnalysis],
+  const activeAnalysis = useMemo(
+    () => analyses.find((item) => item.id === activeAnalysisId) ?? null,
+    [analyses, activeAnalysisId],
   );
 
-  const clear = useCallback(() => {
-    setAnalysisState(null);
+  const analysis = isDemo ? demoAnalysis : activeAnalysis;
+
+  const setAnalysis = useCallback((incoming: Analysis) => {
+    const id = `analysis-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const next: NamedAnalysis = {
+      ...incoming,
+      id,
+      name: `Analysis — ${new Date().toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`,
+      isDemo: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    setAnalysesState((previous) => {
+      const updated = [next, ...previous.filter((item) => item.id !== next.id)];
+      writeAnalyses(updated);
+      return updated;
+    });
+    setActiveAnalysisIdState(id);
+    setIsDemo(false);
     setMessagesState([]);
+
     try {
-      window.localStorage.removeItem(STORAGE_KEY);
-      window.localStorage.removeItem(CHAT_KEY);
+      window.localStorage.setItem(ACTIVE_KEY, id);
+      window.localStorage.removeItem(chatKey(id));
     } catch {
       /* ignore */
     }
   }, []);
 
-  const setMessages = useCallback((m: CoachMessage[]) => {
-    setMessagesState(m);
+  const selectAnalysis = useCallback((id: string) => {
+    setActiveAnalysisIdState(id);
+    setIsDemo(false);
+    setMessagesState(readChat(id));
+
     try {
-      window.localStorage.setItem(CHAT_KEY, JSON.stringify(m));
+      window.localStorage.setItem(ACTIVE_KEY, id);
     } catch {
       /* ignore */
     }
   }, []);
+
+  const renameAnalysis = useCallback((id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    setAnalysesState((current) => {
+      const updated = current.map((item) =>
+        item.id === id ? { ...item, name: trimmed } : item,
+      );
+      writeAnalyses(updated);
+      return updated;
+    });
+  }, []);
+
+  const loadDemo = useCallback(() => {
+    setIsDemo(true);
+    setMessagesState([]);
+  }, []);
+
+  const clear = useCallback(() => {
+    if (isDemo) {
+      setIsDemo(false);
+      setMessagesState([]);
+      return;
+    }
+
+    setAnalysesState((current) => {
+      const remaining = current.filter((item) => item.id !== activeAnalysisId);
+      writeAnalyses(remaining);
+      return remaining;
+    });
+
+    const nextId = analyses.find((item) => item.id !== activeAnalysisId)?.id ?? null;
+    setActiveAnalysisIdState(nextId);
+    setMessagesState(nextId ? readChat(nextId) : []);
+
+    try {
+      if (nextId) window.localStorage.setItem(ACTIVE_KEY, nextId);
+      else window.localStorage.removeItem(ACTIVE_KEY);
+      if (activeAnalysisId) window.localStorage.removeItem(chatKey(activeAnalysisId));
+    } catch {
+      /* ignore */
+    }
+  }, [activeAnalysisId, analyses, isDemo]);
+
+  const removeAnalysis = useCallback(
+    (id: string) => {
+      setAnalysesState((current) => {
+        const remaining = current.filter((item) => item.id !== id);
+        writeAnalyses(remaining);
+        return remaining;
+      });
+
+      if (id === activeAnalysisId) {
+        const nextId = analyses.find((item) => item.id !== id)?.id ?? null;
+        setActiveAnalysisIdState(nextId);
+        setMessagesState(nextId ? readChat(nextId) : []);
+
+        try {
+          if (nextId) window.localStorage.setItem(ACTIVE_KEY, nextId);
+          else window.localStorage.removeItem(ACTIVE_KEY);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      try {
+        window.localStorage.removeItem(chatKey(id));
+      } catch {
+        /* ignore */
+      }
+    },
+    [activeAnalysisId, analyses],
+  );
+
+  const setMessages = useCallback(
+    (nextMessages: CoachMessage[]) => {
+      setMessagesState(nextMessages);
+      if (isDemo || !activeAnalysisId) return;
+
+      try {
+        window.localStorage.setItem(chatKey(activeAnalysisId), JSON.stringify(nextMessages));
+      } catch {
+        /* ignore */
+      }
+    },
+    [activeAnalysisId, isDemo],
+  );
 
   const value = useMemo(
-    () => ({ analysis, messages, setAnalysis, loadDemo, clear, setMessages, ready }),
-    [analysis, messages, setAnalysis, loadDemo, clear, setMessages, ready],
+    () => ({
+      analysis,
+      analyses,
+      activeAnalysisId,
+      isDemo,
+      messages,
+      setAnalysis,
+      selectAnalysis,
+      loadDemo,
+      clear,
+      removeAnalysis,
+      renameAnalysis,
+      setMessages,
+      ready,
+    }),
+    [
+      analysis,
+      analyses,
+      activeAnalysisId,
+      isDemo,
+      messages,
+      setAnalysis,
+      selectAnalysis,
+      loadDemo,
+      clear,
+      removeAnalysis,
+      renameAnalysis,
+      setMessages,
+      ready,
+    ],
   );
 
   return <AnalysisContext.Provider value={value}>{children}</AnalysisContext.Provider>;
